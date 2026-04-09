@@ -1,14 +1,6 @@
 /**
- * ScoutIQ — Flashscore Proxy Server
- * -----------------------------------
- * Draai lokaal: node server.js
- * Of deploy naar Railway / Render / Fly.io
- *
- * SETUP:
- *   npm install
- *   node server.js
- *
- * De app stuurt requests naar http://localhost:3001/api/...
+ * ScoutIQ — Flashscore Proxy Server v2
+ * Betere headers, debug endpoint, fallback parsing
  */
 
 const express = require("express");
@@ -18,26 +10,9 @@ const fetch   = require("node-fetch");
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// Sta requests toe vanuit claude.ai en localhost
-app.use(cors({
-  origin: ["http://localhost:3000", "https://claude.ai", "https://www.claudeusercontent.com"],
-  methods: ["GET"],
-}));
+app.use(cors({ origin: "*", methods: ["GET"] }));
 
-// ─── Flashscore headers (nabootsen van browser) ────────────────────────────
-const FS_HEADERS = {
-  "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-  "Accept":          "application/json, text/plain, */*",
-  "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
-  "Referer":         "https://www.flashscore.nl/",
-  "Origin":          "https://www.flashscore.nl",
-  "x-fsign":         "SW9D1eZo",   // publieke signing key die Flashscore gebruikt
-};
-
-const FS_BASE = "https://www.flashscore.nl";
-
-// ─── Eredivisie team IDs op Flashscore ────────────────────────────────────
-// Format: { "clubnaam": "flashscore-team-id" }
+// ─── Flashscore team IDs ────────────────────────────────────────────────────
 const TEAM_IDS = {
   "Ajax":             "WNNf2vJ8",
   "PSV":              "I5mLFMlG",
@@ -59,222 +34,260 @@ const TEAM_IDS = {
   "Fortuna Sittard":  "tpB1WdVp",
 };
 
-// ─── Hulpfunctie: fetch met foutafhandeling ────────────────────────────────
-async function fsFetch(url) {
-  const res = await fetch(url, { headers: FS_HEADERS });
-  if (!res.ok) throw new Error(`Flashscore HTTP ${res.status} voor ${url}`);
-  return res.text();
+// ─── Headers die een echte browser nabootsen ────────────────────────────────
+function getHeaders(referer = "https://www.flashscore.nl/") {
+  return {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept": "text/plain, */*; q=0.01",
+    "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": referer,
+    "Origin": "https://www.flashscore.nl",
+    "x-fsign": "SW9D1eZo",
+    "x-requested-with": "XMLHttpRequest",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+  };
 }
 
-// ─── Route 1: haal meest recente wedstrijd op van een club ─────────────────
-// GET /api/matches/:clubnaam
-app.get("/api/matches/:clubnaam", async (req, res) => {
+// ─── Health check ────────────────────────────────────────────────────────────
+app.get("/health", (_, res) => res.json({ status: "ok", server: "ScoutIQ Proxy v2" }));
+
+// ─── Debug: zie ruwe Flashscore response ─────────────────────────────────────
+app.get("/api/debug/:clubnaam", async (req, res) => {
   try {
     const clubnaam = decodeURIComponent(req.params.clubnaam);
     const teamId   = TEAM_IDS[clubnaam];
+    if (!teamId) return res.json({ error: "Club niet gevonden", beschikbaar: Object.keys(TEAM_IDS) });
 
-    if (!teamId) {
-      return res.status(404).json({ error: `Onbekende club: ${clubnaam}` });
-    }
+    const url = `https://www.flashscore.nl/x/feed/tr_1_${teamId}`;
+    const resp = await fetch(url, { headers: getHeaders() });
 
-    // Flashscore feed: recente wedstrijden van een team
-    const url  = `${FS_BASE}/x/feed/tr_1_${teamId}`;
-    const body = await fsFetch(url);
-
-    // Flashscore geeft eigen formaat terug — parse het
-    const wedstrijden = parseFlashscoreMatches(body, clubnaam);
-
-    res.json({ club: clubnaam, wedstrijden });
+    res.json({
+      club: clubnaam,
+      teamId,
+      url,
+      httpStatus: resp.status,
+      httpOk: resp.ok,
+      contentType: resp.headers.get("content-type"),
+      rawBody: (await resp.text()).slice(0, 2000),
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    res.json({ error: err.message });
   }
 });
 
-// ─── Route 2: haal opstelling op van een specifieke wedstrijd ──────────────
-// GET /api/lineup/:matchId
-app.get("/api/lineup/:matchId", async (req, res) => {
+// ─── Debug lineup ─────────────────────────────────────────────────────────────
+app.get("/api/debug-lineup/:matchId", async (req, res) => {
   try {
-    const matchId = req.params.matchId;
-
-    // Flashscore line-ups feed
-    const url  = `${FS_BASE}/x/feed/lineups-${matchId}`;
-    const body = await fsFetch(url);
-
-    const opstelling = parseFlashscoreLineup(body);
-
-    res.json({ matchId, ...opstelling });
+    const url  = `https://www.flashscore.nl/x/feed/lineups-${req.params.matchId}`;
+    const resp = await fetch(url, { headers: getHeaders() });
+    res.json({
+      url,
+      httpStatus: resp.status,
+      rawBody: (await resp.text()).slice(0, 3000),
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    res.json({ error: err.message });
   }
 });
 
-// ─── Route 3: alles in één — geef laatste opstelling van een club ──────────
-// GET /api/laatste-opstelling/:clubnaam
+// ─── Laatste opstelling ───────────────────────────────────────────────────────
 app.get("/api/laatste-opstelling/:clubnaam", async (req, res) => {
   try {
     const clubnaam = decodeURIComponent(req.params.clubnaam);
     const teamId   = TEAM_IDS[clubnaam];
-
-    if (!teamId) {
-      return res.status(404).json({ error: `Club "${clubnaam}" niet gevonden. Beschikbare clubs: ${Object.keys(TEAM_IDS).join(", ")}` });
-    }
+    if (!teamId) return res.status(404).json({ error: `Club "${clubnaam}" niet gevonden` });
 
     // Stap 1: haal recente wedstrijden op
-    const matchUrl  = `${FS_BASE}/x/feed/tr_1_${teamId}`;
-    const matchBody = await fsFetch(matchUrl);
-    const wedstrijden = parseFlashscoreMatches(matchBody, clubnaam);
-
-    if (!wedstrijden.length) {
-      return res.status(404).json({ error: "Geen gespeelde wedstrijden gevonden" });
+    const matchUrl  = `https://www.flashscore.nl/x/feed/tr_1_${teamId}`;
+    const matchResp = await fetch(matchUrl, { headers: getHeaders() });
+    if (!matchResp.ok) {
+      return res.status(502).json({ error: `Flashscore HTTP ${matchResp.status}`, url: matchUrl });
     }
 
-    // Stap 2: neem meest recente gespeelde wedstrijd
-    const laatste = wedstrijden[0];
+    const matchBody = await matchResp.text();
+    console.log(`[${clubnaam}] Match body preview:`, matchBody.slice(0, 300));
 
-    // Stap 3: haal opstelling op
-    const lineupUrl  = `${FS_BASE}/x/feed/lineups-${laatste.id}`;
-    const lineupBody = await fsFetch(lineupUrl);
-    const opstelling = parseFlashscoreLineup(lineupBody, clubnaam);
+    const wedstrijden = parseMatches(matchBody, clubnaam);
+    console.log(`[${clubnaam}] Gevonden wedstrijden:`, wedstrijden.length);
+
+    if (!wedstrijden.length) {
+      return res.status(404).json({
+        error: "Geen gespeelde wedstrijden gevonden",
+        rawPreview: matchBody.slice(0, 500)
+      });
+    }
+
+    // Stap 2: haal opstelling op van meest recente wedstrijd
+    const laatste   = wedstrijden[0];
+    const lineupUrl = `https://www.flashscore.nl/x/feed/lineups-${laatste.id}`;
+    const lineupResp = await fetch(lineupUrl, { headers: getHeaders(`https://www.flashscore.nl/wedstrijd/${laatste.id}/#/wedstrijd-samenvatting/opstellingen`) });
+
+    if (!lineupResp.ok) {
+      return res.status(502).json({ error: `Lineup HTTP ${lineupResp.status}`, matchId: laatste.id });
+    }
+
+    const lineupBody = await lineupResp.text();
+    console.log(`[${clubnaam}] Lineup body preview:`, lineupBody.slice(0, 400));
+
+    const opstelling = parseLineup(lineupBody, clubnaam);
 
     res.json({
       club:         clubnaam,
       tegenstander: laatste.tegenstander,
       datum:        laatste.datum,
       score:        laatste.score,
-      thuis:        laatste.thuis,
+      thuis:        laatste.isThuis,
+      thuis_naam:   laatste.thuis,
+      uit_naam:     laatste.uit,
       wedstrijdId:  laatste.id,
       seizoen:      "2025-2026",
       competitie:   "Eredivisie",
       bron:         "flashscore.nl",
       ...opstelling,
     });
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Health check ──────────────────────────────────────────────────────────
-app.get("/health", (_, res) => res.json({ status: "ok", server: "ScoutIQ Proxy" }));
+// ─── Parser: wedstrijden ──────────────────────────────────────────────────────
+function parseMatches(raw, clubnaam) {
+  const results = [];
+  const club_lower = clubnaam.toLowerCase();
 
-// ─── Parser: Flashscore wedstrijden ────────────────────────────────────────
-function parseFlashscoreMatches(raw, clubnaam) {
-  const wedstrijden = [];
-  // Flashscore gebruikt een eigen tekst-formaat gescheiden door "¬" en "÷"
-  const regels = raw.split("÷");
+  // Flashscore scheidt records met "÷" en velden met "¬"
+  const records = raw.split("÷AA÷");
 
-  for (const regel of regels) {
+  for (const record of records.slice(1)) {
     try {
-      // Zoek velden: AA÷matchId¬AB÷status¬...
       const velden = {};
-      regel.split("¬").forEach(v => {
-        const idx = v.indexOf("÷");
-        if (idx > 0) velden[v.slice(0, idx)] = v.slice(idx + 1);
-      });
+      // Elk veld is CODE÷WAARDE gescheiden door ¬
+      const parts = ("AA÷" + record).split("¬");
+      for (const part of parts) {
+        const divIdx = part.indexOf("÷");
+        if (divIdx > 0) {
+          velden[part.slice(0, divIdx)] = part.slice(divIdx + 1);
+        }
+      }
 
-      // Alleen gespeelde Eredivisie wedstrijden (status = 100 = finished)
-      if (!velden["AA"] || velden["AB"] !== "100") continue;
+      // Status 100 = afgelopen wedstrijd
+      if (velden["AB"] !== "100") continue;
 
-      const thuis = velden["CX"] || velden["CL"] || "";
-      const uit   = velden["CY"] || velden["CM"] || "";
+      const thuis = (velden["CX"] || velden["CL"] || "").trim();
+      const uit   = (velden["CY"] || velden["CM"] || "").trim();
 
-      if (!thuis.toLowerCase().includes(clubnaam.toLowerCase()) &&
-          !uit.toLowerCase().includes(clubnaam.toLowerCase())) continue;
+      if (!thuis && !uit) continue;
 
-      wedstrijden.push({
+      const isThuis = thuis.toLowerCase().includes(club_lower);
+      const isUit   = uit.toLowerCase().includes(club_lower);
+      if (!isThuis && !isUit) continue;
+
+      results.push({
         id:           velden["AA"],
         datum:        formatDatum(velden["AD"]),
-        thuis:        thuis,
-        uit:          uit,
-        scoreThuis:   velden["AF"] || "?",
-        scoreUit:     velden["AG"] || "?",
+        thuis,
+        uit,
         score:        `${velden["AF"] || "?"}-${velden["AG"] || "?"}`,
-        tegenstander: thuis.toLowerCase().includes(clubnaam.toLowerCase()) ? uit : thuis,
-        isThuis:      thuis.toLowerCase().includes(clubnaam.toLowerCase()),
+        tegenstander: isThuis ? uit : thuis,
+        isThuis,
       });
-    } catch { /* sla kapotte regels over */ }
+    } catch (e) {
+      // sla kapotte records over
+    }
   }
 
-  // Sorteer: meest recent eerst
-  return wedstrijden.slice(0, 10);
+  return results;
 }
 
-// ─── Parser: Flashscore opstelling ─────────────────────────────────────────
-function parseFlashscoreLineup(raw, clubnaam = "") {
+// ─── Parser: opstelling ───────────────────────────────────────────────────────
+function parseLineup(raw, clubnaam) {
   const basiself      = [];
   const wisselspelers = [];
-  let formatie        = "4-3-3";
-  let formatieThuis   = "";
-  let formatieUit     = "";
+  let   formatie      = "";
+  let   formatieThuis = "";
+  let   formatieUit   = "";
 
-  const regels = raw.split("÷");
+  const records = raw.split("¬");
+  const velden  = {};
 
-  for (const regel of regels) {
-    const velden = {};
-    regel.split("¬").forEach(v => {
-      const idx = v.indexOf("÷");
-      if (idx > 0) velden[v.slice(0, idx)] = v.slice(idx + 1);
-    });
+  for (const part of records) {
+    const divIdx = part.indexOf("÷");
+    if (divIdx > 0) {
+      velden[part.slice(0, divIdx)] = part.slice(divIdx + 1);
+    }
+  }
 
-    // Formatie
-    if (velden["WI"]) formatieThuis = velden["WI"];
-    if (velden["WJ"]) formatieUit   = velden["WJ"];
+  // Formaties
+  if (velden["WI"]) formatieThuis = velden["WI"];
+  if (velden["WJ"]) formatieUit   = velden["WJ"];
+  formatie = formatieThuis || formatieUit || "4-3-3";
 
-    // Speler (type WC = basis, WD = wissel)
-    if (!velden["WC"] && !velden["WD"]) continue;
+  // Spelers — Flashscore groepeert spelers per team
+  // WA = thuisteam spelers blok, WB = uitteam spelers blok
+  // Elk speler blok heeft: WL (voornaam), WM (achternaam), WN (nummer), WO (positie), WK (kapitein)
+
+  // Gebruik regex om speler blokken te vinden
+  const spelerRegex = /WN÷(\d+)¬WO÷([^¬]*)¬(?:WK÷([^¬]*)¬)?WL÷([^¬]*)¬WM÷([^¬]*)/g;
+  let match;
+  let spelerId = 0;
+
+  while ((match = spelerRegex.exec(raw)) !== null) {
+    spelerId++;
+    const [, nummer, positieCode, kapitein, voornaam, achternaam] = match;
+    const naam = `${voornaam} ${achternaam}`.trim();
+    if (!naam || naam === " ") continue;
 
     const speler = {
-      naam:    [velden["WL"] || "", velden["WM"] || ""].join(" ").trim(),
-      nummer:  parseInt(velden["WN"] || "0") || 0,
-      positie: mapPositie(velden["WO"] || ""),
-      kapitein: velden["WK"] === "1",
-      team:    velden["WB"] === "1" ? "thuis" : "uit",
+      naam,
+      nummer: parseInt(nummer) || spelerId,
+      positie: mapPositie(positieCode),
+      kapitein: kapitein === "1",
     };
 
-    if (!speler.naam) continue;
-
-    if (velden["WC"]) basiself.push(speler);
+    // Basis vs wissel: probeer te bepalen via context
+    // Simpele heuristiek: eerste 22 spelers zijn basis (11 thuis + 11 uit)
+    if (basiself.length < 22) basiself.push(speler);
     else wisselspelers.push(speler);
   }
 
-  // Filter op club (thuis of uit team)
-  // Als clubnaam meegegeven: filter op dat team, anders neem thuis-team
-  const isThuis  = basiself.some(s => s.team === "thuis");
-  const teamTag  = "thuis"; // standaard toon thuis-team; uitbreiding mogelijk
-  const basis11  = basiself.filter(s => s.team === teamTag).slice(0, 11);
-  const subs     = wisselspelers.filter(s => s.team === teamTag).slice(0, 7);
-
-  formatie = formatieThuis || formatieUit || "4-3-3";
+  // Neem eerste 11 als basiself van één team (thuis)
+  const basis11 = basiself.slice(0, 11);
+  const subs    = basiself.slice(11, 22).concat(wisselspelers).slice(0, 7);
 
   return {
     formatie,
-    basiself:      basis11.length ? basis11 : basiself.slice(0, 11),
-    wisselspelers: subs.length    ? subs    : wisselspelers.slice(0, 7),
+    basiself:      basis11.length >= 11 ? basis11 : basiself.slice(0, 11),
+    wisselspelers: subs,
+    rawLineupPreview: raw.slice(0, 300),
   };
 }
 
-// ─── Hulpfuncties ──────────────────────────────────────────────────────────
-function formatDatum(timestamp) {
-  if (!timestamp) return "Onbekend";
-  const d = new Date(parseInt(timestamp) * 1000);
-  return d.toLocaleDateString("nl-NL", { day: "numeric", month: "short", year: "numeric" });
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function formatDatum(ts) {
+  if (!ts) return "Onbekend";
+  try {
+    return new Date(parseInt(ts) * 1000).toLocaleDateString("nl-NL", { day: "numeric", month: "short", year: "numeric" });
+  } catch { return ts; }
 }
 
 function mapPositie(code) {
   const map = {
-    "1": "GK", "2": "RB", "3": "CB", "4": "CB", "5": "LB",
-    "6": "CDM", "7": "CM", "8": "CM", "9": "CAM",
-    "10": "RW", "11": "ST", "12": "LW",
-    "G": "GK", "D": "CB", "M": "CM", "F": "ST",
+    "1":"GK","2":"RB","3":"CB","4":"CB","5":"LB",
+    "6":"CDM","7":"CM","8":"CM","9":"CAM",
+    "10":"RW","11":"ST","12":"LW",
+    "G":"GK","D":"CB","M":"CM","F":"ST","A":"ST",
   };
-  return map[code] || code || "MID";
+  return map[String(code)] || code || "MID";
 }
 
-// ─── Start server ──────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅ ScoutIQ Proxy draait op http://localhost:${PORT}`);
-  console.log(`   Test: http://localhost:${PORT}/api/laatste-opstelling/Ajax`);
-  console.log(`   Health: http://localhost:${PORT}/health\n`);
+  console.log(`✅ ScoutIQ Proxy v2 op poort ${PORT}`);
+  console.log(`   Debug Ajax: /api/debug/Ajax`);
 });
